@@ -35,7 +35,7 @@ def main():
     parser.add_argument("-b", "--build-system", choices=["cmake", "autotools", "qmake", "make"], help="Force use of the specified build system rather than trying to autodetect.")
     parser.add_argument("-c", "--compiler", help="Use the specified executable for clang. It should be the same version as the libclang used by YCM. The executable for clang++ will be inferred from this.")
     parser.add_argument("-C", "--configure_opts", default="", help="Additional flags to pass to configure/cmake/etc. e.g. --configure_opts=\"--enable-FEATURE\"")
-    parser.add_argument("-F", "--format", choices=["ycm", "cc"], default="ycm", help="Format of output file (YouCompleteMe or color_coded). Default: ycm")
+    parser.add_argument("-F", "--format", choices=["ycm", "cc", "clion"], default="ycm", help="Format of output file (YouCompleteMe, color_coded or CLion). Default: ycm")
     parser.add_argument("-M", "--make-flags", help="Flags to pass to make when fake-building. Default: -M=\"{}\"".format(" ".join(default_make_flags)))
     parser.add_argument("-o", "--output", help="Save the config file as OUTPUT. Default: .ycm_extra_conf.py, or .color_coded if --format=cc.")
     parser.add_argument("-x", "--language", choices=["c", "c++"], help="Only output flags for the given language. This defaults to whichever language has its compiler invoked the most.")
@@ -76,6 +76,7 @@ def main():
         None:  args["output"],
         "cc":  os.path.join(project_dir, ".color_coded"),
         "ycm": os.path.join(project_dir, ".ycm_extra_conf.py"),
+        "clion": os.path.join(project_dir, "CMakeLists.txt"),
     }[args["format"] if args["output"] is None else None]
 
     if(os.path.exists(config_file) and not args["force"]):
@@ -99,6 +100,7 @@ def main():
     generate_conf = {
         "ycm": generate_ycm_conf,
         "cc":  generate_cc_conf,
+        "clion": generate_clion_conf,
     }[output_format]
 
     # temporary files to hold build logs
@@ -106,8 +108,8 @@ def main():
         with tempfile.NamedTemporaryFile(mode="rw") as cxx_build_log:
             # perform the actual compilation of flags
             fake_build(project_dir, c_build_log.name, cxx_build_log.name, **args)
-            (c_count, c_skip, c_flags) = parse_flags(c_build_log)
-            (cxx_count, cxx_skip, cxx_flags) = parse_flags(cxx_build_log)
+            (c_count, c_skip, c_flags, c_files) = parse_flags(project_dir, c_build_log)
+            (cxx_count, cxx_skip, cxx_flags, cxx_files) = parse_flags(project_dir, cxx_build_log)
 
             print("Collected {} relevant entries for C compilation ({} discarded).".format(c_count, c_skip))
             print("Collected {} relevant entries for C++ compilation ({} discarded).".format(cxx_count, cxx_skip))
@@ -132,11 +134,11 @@ def main():
                 return 3
 
             elif(c_count > cxx_count):
-                lang, flags = ("c", c_flags)
+                lang, flags, files = ("c", c_flags, c_files)
             else:
-                lang, flags = ("c++", cxx_flags)
+                lang, flags, files = ("c++", cxx_flags, cxx_files)
 
-            generate_conf(["-x", lang] + flags, config_file)
+            generate_conf(lang, flags, files, config_file)
             print("Created {} config file with {} {} flags".format(output_format.upper(), len(flags), lang.upper()))
 
 
@@ -267,9 +269,14 @@ def fake_build(project_dir, c_build_log_path, cxx_build_log_path, verbose, make_
 
         if(out_of_tree):
             print("")
+            src_tree_config = os.path.join(project_dir, 'config.h')
+            build_tree_config = os.path.join(build_dir, 'config.h')
+            if os.path.exists(build_tree_config) and not os.path.exists(src_tree_config):
+                shutil.copyfile(build_tree_config, src_tree_config)
             shutil.rmtree(build_dir)
         else:
-            run([make_cmd, "maintainer-clean"], env=env, **proc_opts)
+            #run([make_cmd, "maintainer-clean"], env=env, **proc_opts)
+            pass
 
     elif build_system == "qmake":
         # qmake
@@ -338,7 +345,7 @@ def fake_build(project_dir, c_build_log_path, cxx_build_log_path, verbose, make_
     print("")
 
 
-def parse_flags(build_log):
+def parse_flags(project_dir, build_log):
     '''Creates a list of compiler flags from the build log.
 
     build_log: an iterator of lines
@@ -367,19 +374,40 @@ def parse_flags(build_log):
     define_regex = re.compile("-D([a-zA-Z0-9_]+)=(.*)")
 
     # Used to only bundle filenames with applicable arguments
-    filename_flags = ["-o", "-I", "-isystem", "-iquote", "-include", "-imacros", "-isysroot"]
+    filename_flags = ["-o", "-I", "-isystem", "-iquote", "-include", "-imacros", "-isysroot", "-MT", "-MF"]
 
+    source_files = []
     # Process build log
     for line in build_log:
         if(temp_output.search(line)):
             skip_count += 1
             continue
+        print(line)
 
         line_count += 1
         words = split_flags(line)
 
+        filename_candidates = []
+        next_word_is_arg = False
+        working_dir = None
         for (i, word) in enumerate(words):
-            if(word[0] != '-' or not flags_whitelist.match(word)):
+            if i == 0:
+                working_dir = word
+                continue
+            if next_word_is_arg:
+                next_word_is_arg = False
+                continue
+
+            if word[0] != '-':
+                print("   filename candidate: " + word)
+                filename_candidates.append(word)
+                continue
+            elif not flags_whitelist.match(word):
+                if(i != len(words) - 1 and word in filename_flags and words[i + 1][0] != '-'):
+                    next_word_is_arg = True
+                    print("    skip with arg: " + word)
+                else:
+                    print("    skip one: " + word)
                 continue
 
             # handle macro definitions
@@ -395,8 +423,18 @@ def parse_flags(build_log):
             # include arguments for this option, if there are any, as a tuple
             if(i != len(words) - 1 and word in filename_flags and words[i + 1][0] != '-'):
                 flags.add((word, words[i + 1]))
+                next_word_is_arg = True
             else:
                 flags.add(word)
+
+        if len(filename_candidates) != 1:
+            print("probably linking: " + repr(filename_candidates))
+        else:
+            fn = filename_candidates[0]
+            if not os.path.isabs(fn):
+                fn = os.path.join(working_dir, fn)
+            fn = os.path.relpath(fn, project_dir)
+            source_files.append(fn)
 
     # Only specify one word size (the largest)
     # (Different sizes are used for different files in the linux kernel.)
@@ -417,14 +455,15 @@ def parse_flags(build_log):
 
         flags.add("-D{}={}".format(name, values[0]))
 
-    return (line_count, skip_count, sorted(flags))
+    return (line_count, skip_count, sorted(flags), source_files)
 
 
-def generate_cc_conf(flags, config_file):
+def generate_cc_conf(lang, flags, files, config_file):
     '''Generates the .color_coded file
 
     flags: the list of flags
     config_file: the path to save the configuration file at'''
+    flags = ['-x', lang] + flags
 
     with open(config_file, "w") as output:
         for flag in flags:
@@ -435,12 +474,13 @@ def generate_cc_conf(flags, config_file):
                     output.write(f + "\n")
 
 
-def generate_ycm_conf(flags, config_file):
+def generate_ycm_conf(lang, flags, files, config_file):
     '''Generates the .ycm_extra_conf.py.
 
     flags: the list of flags
     config_file: the path to save the configuration file at'''
 
+    flags = ['-x', lang] + flags
     template_file = os.path.join(ycm_generator_dir, "template.py")
 
     with open(template_file, "r") as template:
@@ -460,6 +500,24 @@ def generate_ycm_conf(flags, config_file):
                     # copy template
                     output.write(line)
 
+
+def generate_clion_conf(lang, flags, files, config_file):
+    '''Generates a CMakeLists.txt for CLion.
+
+    flags: the list of flags
+    config_file: the path to save the configuration file at'''
+
+    with open(config_file, "w") as output:
+        output.write("# Generated by YCM Generator at {}\n\n".format(str(datetime.datetime.today())))
+        output.write("project(ycm-generated)\n")
+        if lang == 'c':
+            output.write('set(CMAKE_C_FLAGS "{}")\n'.format(' '.join(flags)))
+        else:
+            output.write('set(CMAKE_CXX_FLAGS "{}")\n'.format(' '.join(flags)))
+        output.write('add_executable(exe\n')
+        for file in files:
+            output.write('    {}\n'.format(file))
+        output.write(')\n')
 
 def split_flags(line):
     '''Helper method that splits a string into flags.
